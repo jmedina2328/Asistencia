@@ -1,6 +1,6 @@
 {
-  "name": "AsistenciaPalmista",
-  "description": "A comprehensive student attendance system using QR codes with real-time reporting and AI-generated parent notifications for absences.",
+  "name": "AsistenciaPalmista Pro",
+  "description": "Sistema avanzado de asistencia con auto-registro por QR, base de datos local persistente y notificaciones inteligentes via Gemini.",
   "requestFramePermissions": [
     "camera"
   ]

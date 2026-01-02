@@ -1,11 +1,11 @@
 
 export interface Student {
-  id: string;
-  name: string;
-  grade: string;
-  parentName: string;
-  parentEmail: string;
-  parentPhone: string;
+  id: string; // Unique Identifier (DNI/ID)
+  alumno: string; // Name of the student
+  grado: string; // Grade and section
+  padre: string; // Parent or tutor name
+  contacto: string; // Phone number or contact info
+  registeredAt?: string;
 }
 
 export type AttendanceStatus = 'present' | 'absent' | 'late' | 'pending';
