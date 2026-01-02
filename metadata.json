@@ -1,5 +1,5 @@
 {
-  "name": "AsistenciaPalmista Pro",
+  "name": "AsistenciaPalmista",
   "description": "Sistema avanzado de asistencia con auto-registro por QR, base de datos local persistente y notificaciones inteligentes via Gemini.",
   "requestFramePermissions": [
     "camera"
