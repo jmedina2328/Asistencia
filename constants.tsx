@@ -7,14 +7,14 @@ export const INITIAL_STUDENTS: Student[] = [
     id: 'STU001', 
     alumno: 'Ana García', 
     grado: '5to Secundaria - A', 
-    padre: 'Carlos García', 
+    tutor: 'Carlos García', 
     contacto: '+51 987654321' 
   },
   { 
     id: 'STU002', 
     alumno: 'Luis Pérez', 
     grado: '4to Primaria - B', 
-    padre: 'Marta Pérez', 
+    tutor: 'Marta Pérez', 
     contacto: '+51 912345678' 
   },
 ];

@@ -5,17 +5,24 @@ import { Student, AttendanceRecord, AttendanceStatus } from './types';
 import QRScanner from './components/QRScanner';
 import { generateAttendanceMessage } from './services/geminiService';
 
+// Extender la interfaz para guardar el mensaje generado
+interface ExtendedAttendanceRecord extends AttendanceRecord {
+  generatedMessage?: string;
+}
+
 const App: React.FC = () => {
   const [students, setStudents] = useState<Student[]>([]);
-  const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [records, setRecords] = useState<ExtendedAttendanceRecord[]>([]);
   const [view, setView] = useState<'scan' | 'list' | 'students' | 'reports'>('scan');
   const [isScanning, setIsScanning] = useState(true);
   const [notifications, setNotifications] = useState<{ id: string; msg: string; type: 'success' | 'alert' | 'info' }[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [showHelp, setShowHelp] = useState(false);
+  
+  // Estado para selección múltiple
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
-  // Refs para control de duplicados en escaneo
   const lastScannedRef = useRef<{ id: string; time: number } | null>(null);
 
   const dateKey = useMemo(() => {
@@ -27,15 +34,16 @@ const App: React.FC = () => {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
   }), []);
 
-  // 1. Inicialización de Base de Datos
   useEffect(() => {
-    const storedStudents = localStorage.getItem('palmista_db_v8');
+    // Usar una versión de DB consistente para evitar colisiones con versiones anteriores
+    const dbVersion = 'palmista_db_v12_pro';
+    const storedStudents = localStorage.getItem(dbVersion);
     let currentStudents: Student[] = [];
     if (storedStudents) {
       currentStudents = JSON.parse(storedStudents);
     } else {
       currentStudents = INITIAL_STUDENTS;
-      localStorage.setItem('palmista_db_v8', JSON.stringify(currentStudents));
+      localStorage.setItem(dbVersion, JSON.stringify(currentStudents));
     }
     setStudents(currentStudents);
 
@@ -43,7 +51,7 @@ const App: React.FC = () => {
     if (storedRecords) {
       setRecords(JSON.parse(storedRecords));
     } else {
-      const initialRecords: AttendanceRecord[] = currentStudents.map(s => ({
+      const initialRecords: ExtendedAttendanceRecord[] = currentStudents.map(s => ({
         studentId: s.id,
         date: dateKey,
         time: null,
@@ -57,7 +65,7 @@ const App: React.FC = () => {
   }, [dateKey]);
 
   useEffect(() => {
-    localStorage.setItem('palmista_db_v8', JSON.stringify(students));
+    localStorage.setItem('palmista_db_v12_pro', JSON.stringify(students));
   }, [students]);
 
   useEffect(() => {
@@ -73,38 +81,103 @@ const App: React.FC = () => {
   }, []);
 
   const deleteStudent = (id: string) => {
-    if (!confirm("¿Está seguro de eliminar a este estudiante? Se borrará también su registro de hoy.")) return;
-    
+    if (!confirm("¿Está seguro de eliminar a este estudiante?")) return;
     setStudents(prev => prev.filter(s => s.id !== id));
     setRecords(prev => prev.filter(r => r.studentId !== id));
-    addNotification("Estudiante eliminado correctamente", "info");
+    setSelectedIds(prev => prev.filter(sid => sid !== id));
+    addNotification("Estudiante eliminado", "info");
   };
 
-  // 2. Lógica de Escaneo con Mapeo Específico y Prevención de Duplicados
-  const handleScan = useCallback(async (data: string) => {
-    if (isProcessing) return;
+  const deleteSelectedStudents = () => {
+    if (selectedIds.length === 0) return;
+    if (!confirm(`¿Está seguro de eliminar a los ${selectedIds.length} estudiantes seleccionados?`)) return;
     
-    let parsedQR: any = null;
+    setStudents(prev => prev.filter(s => !selectedIds.includes(s.id)));
+    setRecords(prev => prev.filter(r => !selectedIds.includes(r.studentId)));
+    setSelectedIds([]);
+    addNotification(`${selectedIds.length} estudiantes eliminados`, "info");
+  };
+
+  const toggleSelectStudent = (id: string) => {
+    setSelectedIds(prev => 
+      prev.includes(id) ? prev.filter(sid => sid !== id) : [...prev, id]
+    );
+  };
+
+  const toggleSelectAll = () => {
+    const filteredIds = filteredStudents.map(s => s.id);
+    if (selectedIds.length === filteredIds.length && filteredIds.length > 0) {
+      setSelectedIds([]);
+    } else {
+      setSelectedIds(filteredIds);
+    }
+  };
+
+  const sendWhatsApp = (phone: string, message: string) => {
+    let cleanPhone = phone.replace(/\D/g, '');
+    if (cleanPhone.length === 9) cleanPhone = '51' + cleanPhone;
+    const url = `https://wa.me/${cleanPhone}?text=${encodeURIComponent(message)}`;
+    window.open(url, '_blank');
+  };
+
+  const parseScannedData = (data: string) => {
+    let parsed: any = null;
     let targetId = data.trim();
 
+    // 1. Intentar detectar JSON (con soporte para comillas relajadas)
     const jsonMatch = data.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
-        parsedQR = JSON.parse(jsonMatch[0]);
-        targetId = (parsedQR.ID || parsedQR.id || parsedQR.dni || parsedQR.codigo || "").toString();
-        if (!targetId) {
-           targetId = `AUTO-${Math.abs(data.split('').reduce((a, b) => { a = ((a << 5) - a) + b.charCodeAt(0); return a & a; }, 0)).toString(36).toUpperCase()}`;
-        }
+        let rawJson = jsonMatch[0];
+        // Normalizar JSON: convertir comillas simples a dobles y asegurar comillas en llaves
+        let normalizedJson = rawJson
+          .replace(/'/g, '"')
+          .replace(/([{,])\s*([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
+        parsed = JSON.parse(normalizedJson);
       } catch (e) {
-        console.error("Error al parsear JSON detectado:", e);
+        console.warn("Error parseando JSON, intentando modo texto estructurado.");
       }
     }
 
-    // Prevención de duplicados (Ignorar mismo ID si fue escaneado hace menos de 5 segundos)
-    const now = Date.now();
-    if (lastScannedRef.current?.id === targetId && now - lastScannedRef.current.time < 5000) {
-      return; 
+    // 2. Si no es JSON o falló, intentar parsear texto estructurado (Key:Value)
+    if (!parsed) {
+      const lines = data.split(/[\n|;,]/);
+      const tempMap: any = {};
+      lines.forEach(line => {
+        const parts = line.split(/[:=]/);
+        if (parts.length >= 2) {
+          const key = parts[0].trim().toUpperCase();
+          const value = parts.slice(1).join(':').trim();
+          tempMap[key] = value;
+        }
+      });
+
+      if (Object.keys(tempMap).length >= 2) {
+        parsed = {
+          ID: tempMap.ID || tempMap.DNI || tempMap.CODIGO || tempMap.DNI_AQUI,
+          alumno: tempMap.ALUMNO || tempMap.NOMBRE || tempMap.ESTUDIANTE || tempMap["USUARIO EJEMPLO"],
+          GS: tempMap.GS || tempMap.GRADO || tempMap.SECCION || tempMap.GRADO_SECCION,
+          Tutor: tempMap.TUTOR || tempMap.PADRE || tempMap.APODERADO,
+          contacto: tempMap.CONTACTO || tempMap.CELULAR || tempMap.TELEFONO || tempMap.WHATSAPP
+        };
+      }
     }
+
+    if (parsed) {
+      targetId = (parsed.ID || parsed.id || parsed.dni || parsed.DNI || targetId).toString();
+    }
+
+    return { parsed, targetId };
+  };
+
+  const handleScan = useCallback(async (data: string) => {
+    if (isProcessing || !data) return;
+    
+    const { parsed, targetId } = parseScannedData(data);
+
+    // Evitar escaneos duplicados inmediatos (cooldown de 4 segundos)
+    const now = Date.now();
+    if (lastScannedRef.current?.id === targetId && now - lastScannedRef.current.time < 4000) return;
     lastScannedRef.current = { id: targetId, time: now };
 
     setIsProcessing(true);
@@ -116,277 +189,231 @@ const App: React.FC = () => {
     if (existingStudent) {
       const record = records.find(r => r.studentId === existingStudent.id);
       if (record?.status === 'present') {
-        addNotification(`Entrada previa registrada: ${existingStudent.alumno} (${record.time})`, 'info');
+        addNotification(`${existingStudent.alumno} ya registró ingreso.`, 'info');
       } else {
-        setRecords(prev => prev.map(r => 
-          r.studentId === existingStudent.id 
-            ? { ...r, status: 'present', time, notificationSent: true }
-            : r
-        ));
-        addNotification(`Ingreso Confirmado: ${existingStudent.alumno} - ${time}`, 'success');
-        generateAttendanceMessage(existingStudent.alumno, existingStudent.padre, 'present', time)
-          .then(msg => addNotification(`NOTIFICACIÓN: ${msg}`, 'info'));
+        try {
+          const msg = await generateAttendanceMessage(existingStudent.alumno, existingStudent.tutor, 'present', time);
+          setRecords(prev => prev.map(r => 
+            r.studentId === existingStudent.id 
+              ? { ...r, status: 'present', time, notificationSent: true, generatedMessage: msg }
+              : r
+          ));
+          // ENVÍO AUTOMÁTICO A WHATSAPP
+          sendWhatsApp(existingStudent.contacto, msg);
+          addNotification(`Ingreso Exitoso y Reporte Enviado: ${existingStudent.alumno}`, 'success');
+        } catch (err) {
+          addNotification(`Error al procesar reporte IA para ${existingStudent.alumno}`, 'alert');
+        }
       }
     } else {
-      // Registro Automático según claves específicas solicitadas
-      if (parsedQR && (parsedQR["Usuario ejemplo"] || parsedQR.alumno || parsedQR.nombre)) {
+      // Intentar auto-registro si el QR trae la información completa de Palmista QR Assistant
+      const studentName = parsed?.alumno || parsed?.nombre || parsed?.["Usuario ejemplo"];
+      if (studentName) {
         const newStudent: Student = {
           id: targetId,
-          alumno: parsedQR["Usuario ejemplo"] || parsedQR.alumno || parsedQR.nombre || 'Desconocido',
-          grado: parsedQR["GS"] || parsedQR.grado || parsedQR.seccion || 'S/G',
-          padre: parsedQR["Padre/tutor"] || parsedQR.padre || parsedQR.tutor || 'Sin Tutor',
-          contacto: parsedQR.contacto || parsedQR.telefono || 'S/N',
-          registeredAt: new Date().toISOString()
+          alumno: studentName,
+          grado: parsed.GS || parsed.grado || 'S/G',
+          tutor: parsed.Tutor || parsed.tutor || parsed["Padre/tutor"] || 'Sin Tutor',
+          contacto: parsed.contacto || parsed.celular || 'S/N',
         };
-
-        setStudents(prev => [...prev, newStudent]);
         
-        const newRecord: AttendanceRecord = {
-          studentId: newStudent.id,
-          date: dateKey,
-          time,
-          status: 'present',
-          notificationSent: true,
-          justificationReceived: false
-        };
-
-        setRecords(prev => [...prev, newRecord]);
-        addNotification(`AUTO-REGISTRO: ${newStudent.alumno} (DNI: ${newStudent.id})`, 'success');
-
-        generateAttendanceMessage(newStudent.alumno, newStudent.padre, 'present', time)
-          .then(msg => addNotification(`REPORTE IA: ${msg}`, 'info'));
+        try {
+          const msg = await generateAttendanceMessage(newStudent.alumno, newStudent.tutor, 'present', time);
+          setStudents(prev => [...prev, newStudent]);
+          setRecords(prev => [...prev, {
+            studentId: newStudent.id,
+            date: dateKey,
+            time,
+            status: 'present',
+            notificationSent: true,
+            justificationReceived: false,
+            generatedMessage: msg
+          }]);
+          // ENVÍO AUTOMÁTICO A WHATSAPP PARA NUEVO REGISTRO
+          sendWhatsApp(newStudent.contacto, msg);
+          addNotification(`Nuevo Alumno Registrado y Reporte Enviado: ${newStudent.alumno}`, 'success');
+        } catch (err) {
+          addNotification(`Error en auto-registro de ${newStudent.alumno}`, 'alert');
+        }
       } else {
-        addNotification(`QR no estructurado o incompleto.`, 'alert');
+        addNotification(`QR Detectado: ID ${targetId} no existe en la base de datos.`, 'alert');
       }
     }
 
     setTimeout(() => {
       setIsProcessing(false);
       setIsScanning(true);
-    }, 2500);
+    }, 1500);
   }, [records, students, isProcessing, dateKey, addNotification]);
 
   const markAbsences = async () => {
     const pending = records.filter(r => r.status === 'pending');
-    if (pending.length === 0) {
-      addNotification("No hay alumnos pendientes por registrar hoy.", 'info');
-      return;
-    }
+    if (pending.length === 0) return addNotification("No hay asistencias pendientes por cerrar.", 'info');
 
-    if (!confirm(`¿Cerrar jornada escolar? ${pending.length} alumnos serán marcados con FALTA.`)) return;
+    if (!confirm(`¿Cerrar jornada escolar? Se generarán reportes de inasistencia para ${pending.length} estudiantes.`)) return;
 
-    setRecords(prev => prev.map(r => r.status === 'pending' ? { ...r, status: 'absent', notificationSent: true } : r));
-    addNotification("Generando alertas de inasistencia para padres...", 'alert');
-
+    setIsProcessing(true);
+    const updatedRecords = [...records];
     for (const rec of pending) {
       const s = students.find(std => std.id === rec.studentId);
       if (s) {
-        generateAttendanceMessage(s.alumno, s.padre, 'absent')
-          .then(msg => console.log(`Alerta enviada: ${msg}`))
-          .catch(e => console.error(e));
+        const msg = await generateAttendanceMessage(s.alumno, s.tutor, 'absent');
+        const index = updatedRecords.findIndex(r => r.studentId === rec.studentId);
+        updatedRecords[index] = { ...updatedRecords[index], status: 'absent', notificationSent: true, generatedMessage: msg };
+        // No enviamos automático en cierre de jornada para no saturar el navegador con 50 pestañas
       }
     }
+    setRecords(updatedRecords);
+    setIsProcessing(false);
+    addNotification("Jornada cerrada con éxito. Los reportes de falta están listos en la sección Reportes.", 'alert');
   };
 
   const filteredStudents = useMemo(() => students.filter(s => 
-    s.alumno.toLowerCase().includes(searchTerm.toLowerCase()) || 
-    s.id.toLowerCase().includes(searchTerm.toLowerCase())
+    s.alumno.toLowerCase().includes(searchTerm.toLowerCase()) || s.id.includes(searchTerm)
   ), [students, searchTerm]);
 
   return (
     <div className="min-h-screen bg-slate-50 pb-36 font-sans antialiased">
-      {/* Header Premium */}
       <header className="bg-white/95 backdrop-blur-2xl border-b border-slate-200 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 py-5 flex items-center justify-between">
-          <div className="flex items-center gap-5 group cursor-pointer" onClick={() => setView('scan')}>
-            <div className="bg-indigo-600 p-3 rounded-2xl shadow-xl shadow-indigo-100 group-hover:rotate-6 transition-all">
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
-              </svg>
+          <div className="flex items-center gap-4 cursor-pointer group" onClick={() => setView('scan')}>
+            <div className="bg-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-100 group-hover:scale-110 transition-transform">
+              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" /></svg>
             </div>
             <div>
-              <h1 className="text-2xl font-black text-slate-900 tracking-tighter leading-none mb-1">Palmista Scan <span className="text-indigo-600 italic">v8</span></h1>
-              <p className="text-[10px] text-slate-400 font-black uppercase tracking-[0.2em]">{displayDate}</p>
+              <h1 className="text-xl font-black text-slate-900 leading-none mb-1">Palmista <span className="text-indigo-600">Assistant</span></h1>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Envío Automático Activo • {displayDate}</p>
             </div>
           </div>
-          <div className="hidden lg:flex items-center gap-6">
-             <div className="text-right">
-                <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest block mb-1">Registro Estudiantil Activo</span>
-                <div className="flex items-center gap-3">
-                   <div className="w-40 h-2.5 bg-slate-100 rounded-full overflow-hidden shadow-inner">
-                      <div className="h-full bg-indigo-600 shadow-[0_0_15px_rgba(79,70,229,0.5)] transition-all duration-1000" style={{width: `${Math.min((students.length / 600) * 100, 100)}%`}}></div>
-                   </div>
-                   <span className="text-sm font-black text-indigo-600 tabular-nums">{students.length} / 600+</span>
-                </div>
-             </div>
+          <div className="flex items-center gap-6">
+            <div className="hidden sm:block text-right">
+              <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Estado</p>
+              <p className="text-sm font-black text-indigo-600">{students.length} alumnos registrados</p>
+            </div>
           </div>
         </div>
       </header>
 
-      {/* Notificaciones */}
-      <div className="fixed top-24 right-4 left-4 z-[100] pointer-events-none flex flex-col gap-3 max-w-md mx-auto lg:mr-8 lg:ml-auto">
+      <div className="fixed top-24 right-4 left-4 z-[100] pointer-events-none flex flex-col gap-3 max-w-md mx-auto sm:mr-8 sm:ml-auto">
         {notifications.map(n => (
-          <div key={n.id} className={`p-5 rounded-[2.5rem] shadow-2xl border-l-[10px] pointer-events-auto transition-all animate-in slide-in-from-right ${
-            n.type === 'success' ? 'bg-white border-emerald-500' : 
-            n.type === 'alert' ? 'bg-white border-rose-500' : 
-            'bg-white border-indigo-500'
+          <div key={n.id} className={`p-5 rounded-[2rem] shadow-2xl border-l-[12px] pointer-events-auto animate-in slide-in-from-right overflow-hidden relative ${
+            n.type === 'success' ? 'bg-white border-emerald-500' : n.type === 'alert' ? 'bg-white border-rose-500' : 'bg-white border-indigo-500'
           }`}>
-             <div className="flex items-start gap-4">
-               <div className={`shrink-0 mt-0.5 ${n.type === 'success' ? 'text-emerald-500' : n.type === 'alert' ? 'text-rose-500' : 'text-indigo-500'}`}>
-                 {n.type === 'success' && <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" /></svg>}
-                 {n.type === 'alert' && <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" /></svg>}
-                 {n.type === 'info' && <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" /></svg>}
-               </div>
-               <p className="text-sm font-extrabold text-slate-800 leading-snug tracking-tight">{n.msg}</p>
+             <p className="text-sm font-extrabold text-slate-800 leading-tight">{n.msg}</p>
+             <div className="absolute bottom-0 left-0 h-1 bg-slate-100 w-full">
+                <div className={`h-full transition-all duration-[6000ms] ease-linear ${n.type === 'success' ? 'bg-emerald-500' : n.type === 'alert' ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{width: '0%'}}></div>
              </div>
           </div>
         ))}
       </div>
 
-      <main className="max-w-7xl mx-auto p-4 sm:p-10">
+      <main className="max-w-7xl mx-auto p-6 sm:p-10">
         {view === 'scan' && (
-          <div className="flex flex-col items-center gap-12 animate-in fade-in zoom-in duration-500">
-            <div className="text-center max-w-2xl space-y-4">
-              <h2 className="text-5xl font-black text-slate-900 tracking-tighter">Panel de <span className="text-indigo-600">Escaneo</span></h2>
-              <p className="text-slate-500 text-lg font-bold leading-relaxed px-6">Registro automático con mapeo inteligente de datos para nuevos alumnos y notificaciones en tiempo real.</p>
-              <button 
-                onClick={() => setShowHelp(!showHelp)}
-                className="inline-flex items-center gap-2 bg-indigo-50 text-indigo-600 px-6 py-2 rounded-full font-black uppercase text-[10px] tracking-widest hover:bg-indigo-100 transition-colors shadow-sm"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                {showHelp ? 'Cerrar Guía' : 'Ver Formato JSON Requerido'}
-              </button>
+          <div className="flex flex-col items-center gap-10 animate-in zoom-in">
+            <div className="text-center space-y-3 max-w-xl">
+              <div className="inline-flex items-center gap-2 bg-emerald-50 text-emerald-600 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-2 border border-emerald-100">
+                 <span className="w-2 h-2 bg-emerald-600 rounded-full animate-ping"></span>
+                 WhatsApp Auto-Sync Activado
+              </div>
+              <h2 className="text-5xl font-black text-slate-900 tracking-tighter">Panel de <span className="text-indigo-600">Registro</span></h2>
+              <p className="text-slate-500 font-bold leading-relaxed">Los reportes se enviarán <span className="text-indigo-900 font-black">automáticamente</span> al WhatsApp del tutor al detectar el QR.</p>
+              <div className="flex gap-2 justify-center">
+                <button onClick={() => setShowHelp(!showHelp)} className="bg-white border-2 border-slate-100 px-6 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:border-indigo-600 transition-colors shadow-sm">Configuración de Formato</button>
+              </div>
             </div>
 
             {showHelp && (
-              <div className="w-full max-w-lg bg-slate-900 text-indigo-100 p-8 rounded-[3rem] font-mono text-xs shadow-2xl animate-in zoom-in border-4 border-indigo-500/20 relative overflow-hidden">
-                <div className="absolute top-0 right-0 p-4 opacity-10">
-                   <svg className="w-20 h-20" fill="currentColor" viewBox="0 0 24 24"><path d="M3 3h6v6H3V3zm12 0h6v6h-6V3zM3 15h6v6H3v-6zm15 0h3v3h-3v-3z" /></svg>
+              <div className="w-full max-w-lg bg-slate-950 text-indigo-100 p-8 rounded-[3rem] font-mono text-[11px] shadow-2xl animate-in zoom-in border-4 border-indigo-500/20">
+                <div className="flex justify-between items-center mb-4 border-b border-white/10 pb-3">
+                   <span className="text-emerald-400 font-black">ESTRUCTURA SOPORTADA</span>
+                   <span className="text-slate-500">v8.2</span>
                 </div>
-                <p className="text-emerald-400 mb-4 font-bold border-b border-white/10 pb-2">Estructura del Código QR:</p>
-                <pre className="whitespace-pre-wrap leading-relaxed text-indigo-300">
+                <pre className="whitespace-pre-wrap leading-relaxed">
 {`{
-  "ID": "12345678",
-  "Usuario ejemplo": "Nombre Alumno",
-  "GS": "Grado y Sección",
-  "Padre/tutor": "Nombre del Padre",
-  "contacto": "Número de Celular"
+  "ID": "74859632",
+  "alumno": "JUAN PEREZ",
+  "GS": "3ro Secundaria",
+  "Tutor": "MARIA PEREZ",
+  "contacto": "987654321"
 }`}
                 </pre>
-                <div className="mt-6 flex gap-2">
-                   <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                   <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-                   <span className="w-2 h-2 rounded-full bg-rose-500"></span>
-                </div>
+                <p className="mt-4 text-[9px] text-slate-500 italic">Nota: Asegúrese de permitir pop-ups en su navegador para que el envío automático funcione correctamente.</p>
               </div>
             )}
-            
-            <div className="w-full max-w-lg relative group">
-              <div className="absolute -inset-2 bg-gradient-to-tr from-indigo-600 via-indigo-400 to-indigo-800 rounded-[3rem] blur-2xl opacity-20 transition duration-1000 group-hover:opacity-40"></div>
+
+            <div className="w-full max-w-md relative group">
+              <div className="absolute -inset-4 bg-gradient-to-tr from-indigo-500 to-emerald-500 rounded-[4rem] blur-3xl opacity-10 group-hover:opacity-20 transition-opacity"></div>
               <div className="relative">
+                <QRScanner onScan={handleScan} isScanning={isScanning} />
                 {isProcessing && (
-                  <div className="absolute inset-0 z-20 bg-white/40 backdrop-blur-md rounded-[2.5rem] flex items-center justify-center">
+                  <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-md rounded-[2.5rem] flex items-center justify-center z-20">
                     <div className="flex flex-col items-center gap-4">
-                      <div className="w-16 h-16 border-[6px] border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-                      <span className="text-sm font-black text-indigo-800 uppercase tracking-[0.3em] animate-pulse">Sincronizando...</span>
+                       <div className="w-16 h-16 border-4 border-white border-t-indigo-500 rounded-full animate-spin"></div>
+                       <span className="font-black text-white text-xs tracking-[0.3em]">PROCESANDO Y ENVIANDO...</span>
                     </div>
                   </div>
                 )}
-                <QRScanner onScan={handleScan} isScanning={isScanning} />
               </div>
             </div>
 
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-8 w-full">
-              {[
-                { label: 'Matriculados', value: students.length, color: 'indigo', icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z' },
-                { label: 'Presentes', value: records.filter(r => r.status === 'present').length, color: 'emerald', icon: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z' },
-                { label: 'En Espera', value: records.filter(r => r.status === 'pending').length, color: 'amber', icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
-                { label: 'Ausentes', value: records.filter(r => r.status === 'absent').length, color: 'rose', icon: 'M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
-              ].map(stat => (
-                <div key={stat.label} className="bg-white p-8 rounded-[3rem] shadow-sm border border-slate-100 flex flex-col items-center text-center transition-all hover:shadow-2xl hover:-translate-y-3 group">
-                  <div className={`w-14 h-14 mb-4 bg-${stat.color}-50 text-${stat.color}-600 rounded-2xl flex items-center justify-center group-hover:bg-${stat.color}-600 group-hover:text-white transition-all shadow-sm`}>
-                    <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d={stat.icon} /></svg>
-                  </div>
-                  <p className="text-[10px] text-slate-300 font-black uppercase tracking-[0.2em] mb-1">{stat.label}</p>
-                  <p className={`text-4xl font-black text-${stat.color}-600 tracking-tighter`}>{stat.value}</p>
-                </div>
-              ))}
-            </div>
-
-            <button 
-              onClick={markAbsences}
-              className="group relative w-full max-w-lg bg-slate-950 hover:bg-black text-white font-black py-8 rounded-[3rem] transition-all shadow-2xl active:scale-[0.96] overflow-hidden"
-            >
-              <span className="relative z-10 flex items-center justify-center gap-5 text-2xl tracking-tight">
-                <svg className="w-8 h-8 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A10.003 10.003 0 0112 3c1.268 0 2.478.235 3.597.663m3.06 3.06a10.048 10.048 0 012.307 5.711" /></svg>
-                Finalizar Jornada
+            <button onClick={markAbsences} className="w-full max-w-md bg-slate-950 hover:bg-black text-white font-black py-8 rounded-[3rem] shadow-2xl transition-all flex items-center justify-center gap-6 text-2xl group relative overflow-hidden">
+              <span className="relative z-10 flex items-center gap-4">
+                 <svg className="w-8 h-8 text-indigo-500 group-hover:scale-125 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                 Cerrar Diario del Día
               </span>
-              <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-1000"></div>
+              <div className="absolute inset-0 bg-indigo-600/10 -translate-x-full group-hover:translate-x-0 transition-transform duration-500"></div>
             </button>
           </div>
         )}
 
         {view === 'list' && (
-          <div className="space-y-10 animate-in slide-in-from-bottom-6 duration-600">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 px-4">
-              <div className="space-y-2">
-                <h2 className="text-5xl font-black text-slate-900 tracking-tighter">Diario de <span className="text-indigo-600">Asistencia</span></h2>
-                <p className="text-slate-500 text-lg font-bold">Resumen de ingresos y alertas del día</p>
-              </div>
-              <button 
-                onClick={() => { if(confirm("¿Seguro que desea reiniciar el diario de hoy?")) setRecords(records.map(r => ({...r, status: 'pending', time: null, notificationSent: false}))); }}
-                className="px-8 py-5 bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-600 rounded-[2rem] text-xs font-black transition-all uppercase tracking-widest border border-rose-100 shadow-sm active:scale-95"
-              >
-                Limpiar Registros
-              </button>
+          <div className="space-y-8 animate-in slide-in-from-bottom-6">
+            <div className="flex justify-between items-end px-4">
+               <div>
+                 <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Reporte <span className="text-indigo-600">Diario</span></h2>
+                 <p className="text-slate-500 font-bold">Bitácora de hoy ({records.length} total)</p>
+               </div>
+               <button onClick={() => { if(confirm("¿Desea limpiar los registros de hoy?")) setRecords(records.map(r => ({...r, status: 'pending', time: null, notificationSent: false, generatedMessage: ''})))}} className="text-rose-600 text-[10px] font-black uppercase tracking-widest border-2 border-rose-50 px-5 py-2 rounded-xl hover:bg-rose-50 transition-colors">Reiniciar Diario</button>
             </div>
             
             <div className="bg-white rounded-[4rem] shadow-2xl shadow-slate-200/50 border border-slate-100 overflow-hidden">
               <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse min-w-[950px]">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-100">
-                      <th className="px-14 py-8 text-[11px] font-black text-slate-300 uppercase tracking-[0.3em]">Alumno / DNI</th>
-                      <th className="px-14 py-8 text-[11px] font-black text-slate-300 uppercase tracking-[0.3em]">Grado y Sección</th>
-                      <th className="px-14 py-8 text-[11px] font-black text-slate-300 uppercase tracking-[0.3em]">Estado</th>
-                      <th className="px-14 py-8 text-[11px] font-black text-slate-300 uppercase tracking-[0.3em]">Hora Entrada</th>
-                      <th className="px-14 py-8 text-[11px] font-black text-slate-300 uppercase tracking-[0.3em]">Reporte</th>
+                <table className="w-full text-left border-collapse">
+                  <thead className="bg-slate-50 border-b border-slate-100">
+                    <tr className="text-[11px] font-black text-slate-300 uppercase tracking-[0.2em]">
+                      <th className="px-12 py-8">Estudiante / DNI</th>
+                      <th className="px-12 py-8">Estado de Asistencia</th>
+                      <th className="px-12 py-8">Hora Registro</th>
+                      <th className="px-12 py-8 text-center">Reporte WhatsApp</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-50">
-                    {records.map(record => {
-                      const student = students.find(s => s.id === record.studentId);
+                    {records.map(r => {
+                      const s = students.find(std => std.id === r.studentId);
                       return (
-                        <tr key={record.studentId} className="hover:bg-indigo-50/40 transition-all group">
-                          <td className="px-14 py-8">
-                            <div className="font-black text-slate-900 text-xl group-hover:text-indigo-600 transition-colors leading-none mb-2">{student?.alumno || 'DNI: ' + record.studentId}</div>
-                            <div className="text-[10px] text-slate-400 font-black font-mono tracking-widest uppercase opacity-60">Matrícula: {record.studentId}</div>
+                        <tr key={r.studentId} className="hover:bg-indigo-50/30 transition-all group">
+                          <td className="px-12 py-8">
+                             <div className="font-black text-slate-900 text-lg group-hover:text-indigo-600 transition-colors">{s?.alumno || 'DNI: ' + r.studentId}</div>
+                             <div className="text-[10px] text-slate-400 font-bold font-mono tracking-tighter">{s?.grado || 'Sin Grado'}</div>
                           </td>
-                          <td className="px-14 py-8">
-                            <span className="text-sm font-extrabold text-slate-500 bg-slate-100 px-4 py-1.5 rounded-xl border border-slate-200/50">{student?.grado || 'S/G'}</span>
-                          </td>
-                          <td className="px-14 py-8">
-                            <span className={`px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-sm flex items-center gap-3 w-fit ${
-                              record.status === 'present' ? 'bg-emerald-500 text-white shadow-emerald-100' :
-                              record.status === 'absent' ? 'bg-rose-500 text-white shadow-rose-100' :
+                          <td className="px-12 py-8">
+                            <span className={`px-5 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 w-fit shadow-sm ${
+                              r.status === 'present' ? 'bg-emerald-500 text-white' : 
+                              r.status === 'absent' ? 'bg-rose-500 text-white' : 
                               'bg-slate-200 text-slate-500'
                             }`}>
-                              <div className={`w-2 h-2 rounded-full ${record.status === 'present' ? 'bg-white animate-ping' : record.status === 'absent' ? 'bg-white' : 'bg-slate-400'}`}></div>
-                              {record.status === 'present' ? 'Presente' : record.status === 'absent' ? 'Ausente' : 'Pendiente'}
+                              <div className={`w-1.5 h-1.5 rounded-full ${r.status === 'present' ? 'bg-white animate-pulse' : 'bg-current'}`}></div>
+                              {r.status === 'present' ? 'Presente' : r.status === 'absent' ? 'Ausente' : 'En Espera'}
                             </span>
                           </td>
-                          <td className="px-14 py-8">
-                            <span className="text-sm font-black text-slate-600 tracking-tighter tabular-nums">{record.time || '--:--'}</span>
-                          </td>
-                          <td className="px-14 py-8">
-                             {record.notificationSent ? (
-                               <div className="flex items-center gap-2 text-indigo-600 font-black text-[10px] uppercase tracking-widest bg-indigo-50 px-4 py-2 rounded-full w-fit border border-indigo-100">
-                                 <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" /></svg>
-                                 Enviado
-                               </div>
-                             ) : (
-                               <span className="text-[10px] font-black text-slate-200 uppercase italic tracking-widest">Sin Enviar</span>
-                             )}
+                          <td className="px-12 py-8 text-sm font-black text-slate-600 tabular-nums">{r.time || '--:--'}</td>
+                          <td className="px-12 py-8 text-center">
+                            {r.notificationSent ? (
+                              <div className="inline-flex items-center gap-1.5 text-indigo-600 font-black text-[10px] uppercase bg-indigo-50 px-3 py-1.5 rounded-full">
+                                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd"/></svg>
+                                Enviado
+                              </div>
+                            ) : <span className="text-[10px] text-slate-200 font-bold">No enviado</span>}
                           </td>
                         </tr>
                       );
@@ -399,68 +426,86 @@ const App: React.FC = () => {
         )}
 
         {view === 'students' && (
-          <div className="space-y-10 animate-in slide-in-from-bottom-6 duration-600">
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-end gap-8 px-6">
-              <div className="space-y-2">
-                <h2 className="text-5xl font-black text-slate-900 tracking-tighter">Base de <span className="text-indigo-600">Datos</span></h2>
-                <p className="text-slate-500 text-lg font-bold">Gestión de {students.length} alumnos registrados</p>
+          <div className="space-y-8 animate-in slide-in-from-bottom-6">
+            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-end gap-6 px-4">
+              <div>
+                <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Base <span className="text-indigo-600">Estudiantil</span></h2>
+                <p className="text-slate-500 font-bold">Gestión centralizada de matriculados</p>
               </div>
-              <div className="relative w-full lg:w-96 group">
-                <input 
-                  type="text" 
-                  placeholder="Buscar alumno o DNI..." 
-                  className="w-full pl-16 pr-8 py-6 bg-white border-4 border-slate-50 rounded-[2.5rem] text-sm font-black focus:outline-none focus:border-indigo-600 focus:ring-12 focus:ring-indigo-600/5 transition-all shadow-xl shadow-slate-200/40"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-                <svg className="w-7 h-7 absolute left-6 top-1/2 -translate-y-1/2 text-slate-300 group-focus-within:text-indigo-600 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+              <div className="flex flex-col sm:flex-row gap-4 w-full lg:w-auto">
+                <div className="relative flex-1 sm:w-80">
+                  <input 
+                    type="text" 
+                    placeholder="Buscar alumno o ID..." 
+                    value={searchTerm} 
+                    onChange={e => setSearchTerm(e.target.value)} 
+                    className="bg-white border-4 border-slate-100 rounded-[2rem] pl-14 pr-6 py-4 text-sm font-bold focus:border-indigo-600 outline-none w-full shadow-xl shadow-slate-200/40 transition-all" 
+                  />
+                  <svg className="w-6 h-6 absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                </div>
+                {selectedIds.length > 0 && (
+                  <button 
+                    onClick={deleteSelectedStudents}
+                    className="bg-rose-600 text-white px-8 py-4 rounded-[2rem] font-black text-xs uppercase tracking-widest flex items-center justify-center gap-3 animate-in zoom-in shadow-xl shadow-rose-100 active:scale-95 transition-transform"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    Eliminar Selección ({selectedIds.length})
+                  </button>
+                )}
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-10">
-              {filteredStudents.map(student => (
-                <div key={student.id} className="bg-white p-12 rounded-[4rem] border border-slate-100 shadow-sm hover:shadow-2xl hover:-translate-y-3 transition-all group relative overflow-hidden">
-                  <div className="absolute top-0 right-0 w-40 h-40 bg-indigo-50/50 rounded-bl-[6rem] -mr-12 -mt-12 transition-all group-hover:bg-indigo-600/10"></div>
+            <div className="flex items-center gap-4 bg-white/50 p-4 rounded-3xl border border-slate-100">
+               <input 
+                type="checkbox" 
+                className="w-6 h-6 rounded-xl border-2 border-slate-200 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                checked={selectedIds.length === filteredStudents.length && filteredStudents.length > 0}
+                onChange={toggleSelectAll}
+               />
+               <span className="text-xs font-black text-slate-400 uppercase tracking-[0.2em]">Seleccionar Todos los Resultados</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
+              {filteredStudents.map(s => (
+                <div key={s.id} className={`bg-white p-10 rounded-[4rem] border-4 transition-all relative group overflow-hidden ${selectedIds.includes(s.id) ? 'border-indigo-600 shadow-2xl scale-[1.02]' : 'border-transparent shadow-sm hover:shadow-xl'}`}>
+                  <div className="absolute top-0 right-0 w-32 h-32 bg-slate-50/50 rounded-bl-[4rem] -mr-8 -mt-8 group-hover:bg-indigo-50/80 transition-colors"></div>
                   
-                  {/* Botón eliminar */}
+                  {/* Selector Múltiple */}
+                  <input 
+                    type="checkbox" 
+                    className="absolute top-10 left-10 w-7 h-7 rounded-xl border-2 border-slate-200 text-indigo-600 focus:ring-indigo-500 z-10 cursor-pointer"
+                    checked={selectedIds.includes(s.id)}
+                    onChange={() => toggleSelectStudent(s.id)}
+                  />
+                  
+                  {/* Botón eliminar individual */}
                   <button 
-                    onClick={() => deleteStudent(student.id)}
-                    className="absolute top-6 right-6 z-20 p-3 bg-rose-50 text-rose-500 rounded-full opacity-0 group-hover:opacity-100 hover:bg-rose-500 hover:text-white transition-all shadow-sm"
-                    title="Eliminar Estudiante"
+                    onClick={() => deleteStudent(s.id)} 
+                    className="absolute top-8 right-8 p-3 bg-rose-50 text-rose-500 rounded-2xl opacity-0 group-hover:opacity-100 transition-all z-10 hover:bg-rose-500 hover:text-white shadow-sm"
                   >
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                   </button>
 
-                  <div className="relative z-10 flex justify-between items-start mb-10">
-                    <div className="w-24 h-24 bg-gradient-to-br from-indigo-600 to-indigo-900 rounded-[2.5rem] flex items-center justify-center text-white text-4xl font-black shadow-2xl shadow-indigo-100 group-hover:rotate-12 transition-all">
-                      {student.alumno.charAt(0)}
+                  <div className="pt-12 flex flex-col items-center text-center">
+                    <div className="w-24 h-24 bg-gradient-to-br from-indigo-600 to-indigo-800 rounded-[2.5rem] flex items-center justify-center text-4xl font-black text-white mb-6 shadow-2xl shadow-indigo-100 group-hover:rotate-6 transition-all">
+                      {s.alumno[0]}
                     </div>
-                    <div className="flex flex-col items-end gap-2">
-                      <span className="px-5 py-2 bg-indigo-50 text-indigo-700 rounded-2xl text-[11px] font-black uppercase tracking-widest border border-indigo-100 shadow-sm">
-                        {student.grado}
-                      </span>
-                      <span className="text-[9px] font-black text-slate-300 uppercase tracking-widest tabular-nums">DNI: {student.id}</span>
-                    </div>
-                  </div>
-                  <h3 className="text-3xl font-black text-slate-900 mb-2 group-hover:text-indigo-700 transition-colors tracking-tight">{student.alumno}</h3>
-                  <div className="space-y-6 border-t border-slate-50 pt-10">
-                    <div className="flex items-center gap-5">
-                       <div className="w-12 h-12 rounded-3xl bg-slate-50 flex items-center justify-center text-slate-400 group-hover:text-indigo-600 group-hover:bg-indigo-50 transition-all">
-                          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
-                       </div>
-                       <div className="flex flex-col">
-                          <span className="text-[10px] font-black text-slate-300 uppercase leading-none mb-1 tracking-widest">Padre / Tutor</span>
-                          <span className="text-lg font-extrabold text-slate-800 tracking-tight">{student.padre}</span>
-                       </div>
-                    </div>
-                    <div className="flex items-center gap-5">
-                       <div className="w-12 h-12 rounded-3xl bg-slate-50 flex items-center justify-center text-slate-400 group-hover:text-emerald-600 group-hover:bg-emerald-50 transition-all">
-                          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" /></svg>
-                       </div>
-                       <div className="flex flex-col">
-                          <span className="text-[10px] font-black text-slate-300 uppercase leading-none mb-1 tracking-widest">Contacto</span>
-                          <span className="text-lg font-extrabold text-slate-800 tracking-tight">{student.contacto}</span>
-                       </div>
+                    <h3 className="text-2xl font-black text-slate-900 mb-2 leading-tight tracking-tight">{s.alumno}</h3>
+                    <div className="px-5 py-1.5 bg-indigo-50 text-indigo-700 rounded-full text-[10px] font-black uppercase tracking-widest mb-8 border border-indigo-100">{s.grado}</div>
+                    
+                    <div className="w-full space-y-4 pt-8 border-t border-slate-50">
+                      <div className="flex justify-between items-center px-2">
+                        <span className="text-[10px] text-slate-300 font-black uppercase tracking-widest">Identificación</span>
+                        <span className="text-sm font-black text-slate-700 font-mono">{s.id}</span>
+                      </div>
+                      <div className="flex justify-between items-center px-2">
+                        <span className="text-[10px] text-slate-300 font-black uppercase tracking-widest">Tutor</span>
+                        <span className="text-sm font-extrabold text-slate-800">{s.tutor}</span>
+                      </div>
+                      <div className="flex justify-between items-center px-2">
+                        <span className="text-[10px] text-slate-300 font-black uppercase tracking-widest">WhatsApp</span>
+                        <span className="text-sm font-black text-emerald-600 tracking-tighter">{s.contacto}</span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -470,70 +515,76 @@ const App: React.FC = () => {
         )}
 
         {view === 'reports' && (
-          <div className="space-y-12 animate-in slide-in-from-bottom-6 duration-600">
-            <div className="px-6 space-y-2">
-              <h2 className="text-5xl font-black text-slate-900 tracking-tighter">Historial de <span className="text-indigo-600">Reportes</span></h2>
-              <p className="text-slate-500 text-lg font-bold">Bitácora de notificaciones enviadas vía Gemini AI</p>
+          <div className="space-y-8 animate-in slide-in-from-bottom-6">
+            <div className="px-4">
+               <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Centro de <span className="text-indigo-600">Notificaciones</span></h2>
+               <p className="text-slate-500 font-bold">Historial de reportes gestionados por Palmista Assistant</p>
             </div>
             
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
-               {records.filter(r => r.notificationSent).map(r => {
-                 const s = students.find(stud => stud.id === r.studentId);
-                 if (!s) return null;
-                 return (
-                   <div key={r.studentId} className="bg-white overflow-hidden rounded-[5rem] border border-slate-100 shadow-xl hover:shadow-2xl transition-all group">
-                      <div className="bg-slate-50 px-12 py-10 flex justify-between items-center border-b border-slate-100">
-                         <div className="flex flex-col">
-                            <span className="text-[10px] text-slate-300 font-black uppercase tracking-[0.3em] leading-none mb-3">Notificación enviada a</span>
-                            <span className="text-xl font-black text-slate-900 tracking-tight">{s.padre}</span>
-                         </div>
-                         <div className={`flex items-center gap-3 px-6 py-2.5 rounded-full text-[11px] font-black tracking-widest shadow-lg ${r.status === 'present' ? 'bg-emerald-500 text-white shadow-emerald-200' : 'bg-rose-500 text-white shadow-rose-200'}`}>
-                           {r.status === 'present' ? 'ASISTENCIA' : 'INASISTENCIA'}
-                         </div>
-                      </div>
-                      <div className="p-12">
-                        <div className="flex items-center gap-6 mb-10">
-                           <div className="w-16 h-16 rounded-[2rem] bg-indigo-600 flex items-center justify-center text-white text-2xl font-black shadow-2xl shadow-indigo-100">
-                              {s.alumno.charAt(0)}
-                           </div>
-                           <div className="flex flex-col">
-                              <p className="font-black text-slate-900 leading-none mb-1.5 text-2xl tracking-tight">{s.alumno}</p>
-                              <p className="text-[11px] text-slate-400 font-black uppercase tracking-[0.2em]">{r.time || 'Cierre Diario'} • {r.date}</p>
-                           </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+              {records.filter(r => r.notificationSent).map(r => {
+                const s = students.find(stud => stud.id === r.studentId);
+                if (!s) return null;
+                return (
+                  <div key={r.studentId} className="bg-white rounded-[4rem] shadow-xl border border-slate-100 flex flex-col group overflow-hidden transition-all hover:shadow-2xl">
+                    <div className="bg-slate-50 p-10 flex justify-between items-center border-b border-slate-100">
+                      <div className="flex items-center gap-6">
+                        <div className="w-16 h-16 bg-indigo-600 rounded-[1.5rem] flex items-center justify-center text-white text-3xl font-black shadow-lg">
+                          {s.alumno[0]}
                         </div>
-                        <div className="relative bg-indigo-50/40 p-10 rounded-[3.5rem] text-sm font-extrabold italic text-slate-600 leading-relaxed border border-indigo-100/30">
-                           "Estimado(a) {s.padre}, confirmamos que {s.alumno} ha sido registrado con {r.status === 'present' ? 'asistencia' : 'inasistencia'} el día de hoy. Reporte procesado por el sistema inteligente Palmista."
+                        <div>
+                          <p className="font-black text-slate-900 text-xl leading-none mb-1.5">{s.alumno}</p>
+                          <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{r.time || 'Ausente'} • {r.date}</p>
                         </div>
                       </div>
-                   </div>
-                 );
-               })}
+                      <div className={`px-5 py-2 rounded-2xl text-[10px] font-black uppercase tracking-[0.2em] shadow-sm ${r.status === 'present' ? 'bg-emerald-500 text-white' : 'bg-rose-500 text-white'}`}>
+                        {r.status === 'present' ? 'ENTRADA' : 'FALTA'}
+                      </div>
+                    </div>
+                    
+                    <div className="p-10 flex flex-col gap-8">
+                       <div className="relative">
+                          <div className="absolute -left-4 top-0 w-1 h-full bg-indigo-100 rounded-full"></div>
+                          <p className="text-base text-slate-600 font-medium italic leading-relaxed">
+                            "{r.generatedMessage || "Sincronizando reporte..."}"
+                          </p>
+                       </div>
+
+                       <div className="flex flex-col gap-3">
+                          <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest text-center">Re-enviar Reporte a {s.tutor}</p>
+                          <button 
+                            onClick={() => sendWhatsApp(s.contacto, r.generatedMessage || "")}
+                            className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-black py-6 rounded-[2.5rem] transition-all flex items-center justify-center gap-4 shadow-xl shadow-emerald-100 active:scale-95 group"
+                          >
+                            <svg className="w-7 h-7 group-hover:rotate-12 transition-transform" fill="currentColor" viewBox="0 0 24 24"><path d="M12.031 6.172c-3.181 0-5.767 2.586-5.768 5.766-.001 1.298.38 2.27 1.019 3.287l-.582 2.128 2.182-.573c.978.58 1.911.928 3.145.929 3.178 0 5.767-2.587 5.768-5.766 0-3.187-2.59-5.771-5.764-5.771zm3.392 8.244c-.144.405-.837.774-1.17.824-.299.045-.677.063-1.092-.069-.252-.08-.575-.187-.988-.365-1.739-.744-2.834-2.521-2.921-2.637-.087-.117-.708-.941-.708-1.793s.448-1.273.607-1.446c.159-.173.346-.217.462-.217s.231.001.332.005c.109.004.258-.041.404.314.159.386.541 1.32.588 1.417.049.098.082.213.017.346s-.097.215-.195.328c-.099.114-.208.254-.297.34-.099.097-.202.203-.087.401.115.197.511.844 1.1 1.369.758.677 1.397.887 1.597.986s.311.083.426-.05c.115-.132.511-.595.648-.793s.273-.165.462-.097c.187.068 1.182.557 1.385.66s.339.155.388.242c.049.087.049.505-.095.91z"/></svg>
+                            Enviar a WhatsApp
+                          </button>
+                       </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {records.filter(r => r.notificationSent).length === 0 && (
+                <div className="col-span-full py-20 text-center bg-white rounded-[4rem] border-4 border-dashed border-slate-100">
+                   <p className="text-slate-300 font-black uppercase tracking-[0.3em]">No hay reportes hoy</p>
+                </div>
+              )}
             </div>
           </div>
         )}
       </main>
 
-      {/* Navegación Inferior */}
-      <nav className="fixed bottom-12 left-1/2 -translate-x-1/2 w-[calc(100%-3.5rem)] max-w-xl bg-slate-950/95 backdrop-blur-3xl rounded-[3.5rem] p-3.5 flex justify-between items-center shadow-[0_35px_60px_-15px_rgba(0,0,0,0.6)] z-[70] border border-white/10 ring-2 ring-white/5">
+      <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 w-[calc(100%-3rem)] max-w-lg bg-slate-950/95 backdrop-blur-2xl rounded-[3.5rem] p-2 flex justify-around items-center shadow-[0_40px_80px_-20px_rgba(0,0,0,0.6)] z-50 border border-white/10 ring-1 ring-white/5">
         {[
           { id: 'scan', label: 'Escanear', icon: 'M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z' },
           { id: 'list', label: 'Diario', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
           { id: 'students', label: 'Alumnos', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z' },
           { id: 'reports', label: 'Reportes', icon: 'M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9' },
-        ].map(navItem => (
-          <button 
-            key={navItem.id}
-            onClick={() => setView(navItem.id as any)}
-            className={`relative flex-1 py-5 flex flex-col items-center gap-2.5 transition-all duration-500 group ${view === navItem.id ? 'text-white scale-110' : 'text-slate-500 hover:text-slate-300'}`}
-          >
-            {view === navItem.id && (
-              <div className="absolute inset-0 bg-white/5 rounded-[3rem] animate-pulse"></div>
-            )}
-            <svg className={`w-7 h-7 transition-all ${view === navItem.id ? 'stroke-[2.5px] text-indigo-500' : 'stroke-2'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d={navItem.icon} /></svg>
-            <span className="text-[9px] font-black uppercase tracking-[0.3em] font-sans">{navItem.label}</span>
-            {view === navItem.id && (
-              <div className="absolute -bottom-1.5 w-10 h-1.5 bg-indigo-500 rounded-full shadow-[0_0_20px_#6366f1]"></div>
-            )}
+        ].map(nav => (
+          <button key={nav.id} onClick={() => setView(nav.id as any)} className={`flex flex-col items-center p-4 transition-all relative ${view === nav.id ? 'text-indigo-400 scale-110' : 'text-slate-500 hover:text-slate-300'}`}>
+            <svg className={`w-7 h-7 transition-all ${view === nav.id ? 'stroke-[2.5px]' : 'stroke-2'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d={nav.icon} /></svg>
+            <span className="text-[9px] font-black uppercase mt-1.5 tracking-[0.2em]">{nav.label}</span>
+            {view === nav.id && <div className="absolute -bottom-1 w-12 h-1 bg-indigo-500 rounded-full shadow-[0_0_15px_#6366f1]"></div>}
           </button>
         ))}
       </nav>

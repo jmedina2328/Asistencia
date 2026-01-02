@@ -3,7 +3,7 @@ export interface Student {
   id: string; // Unique Identifier (DNI/ID)
   alumno: string; // Name of the student
   grado: string; // Grade and section
-  padre: string; // Parent or tutor name
+  tutor: string; // Tutor name (Renamed from padre)
   contacto: string; // Phone number or contact info
   registeredAt?: string;
 }
